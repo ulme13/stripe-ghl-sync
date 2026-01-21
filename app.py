@@ -20,9 +20,10 @@ app = Flask(__name__)
 # Environment variables
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 GHL_API_KEY = os.getenv('GHL_API_KEY')
+GHL_LOCATION_ID = os.getenv('GHL_LOCATION_ID')
 
-# GHL API base URL
-GHL_BASE_URL = 'https://rest.gohighlevel.com/v1'
+# GHL API v2 base URL
+GHL_BASE_URL = 'https://services.leadconnectorhq.com'
 
 
 @app.route('/health', methods=['GET'])
@@ -116,12 +117,13 @@ def sync_to_ghl(email, data):
     """Look up contact in GHL and update custom fields."""
     headers = {
         'Authorization': f'Bearer {GHL_API_KEY}',
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28'
     }
 
     try:
-        # Look up contact by email
-        lookup_url = f'{GHL_BASE_URL}/contacts/lookup?email={email}'
+        # Look up contact by email using v2 API
+        lookup_url = f'{GHL_BASE_URL}/contacts/?locationId={GHL_LOCATION_ID}&query={email}'
         response = requests.get(lookup_url, headers=headers)
 
         if response.status_code != 200:
@@ -137,17 +139,17 @@ def sync_to_ghl(email, data):
 
         contact_id = contacts[0].get('id')
 
-        # Prepare custom fields update payload
+        # Prepare custom fields update payload (v2 format)
         update_payload = {
-            'customField': {
-                'card_name': data['name'],
-                'card_address_line_1': data['address_line_1'],
-                'card_address_line_2': data['address_line_2'],
-                'card_address_city': data['city'],
-                'card_address_state': data['state'],
-                'card_address_country': data['country'],
-                'total_spend': data['amount']
-            }
+            'customFields': [
+                {'key': 'card_name', 'field_value': data['name']},
+                {'key': 'card_address_line_1', 'field_value': data['address_line_1']},
+                {'key': 'card_address_line_2', 'field_value': data['address_line_2']},
+                {'key': 'card_address_city', 'field_value': data['city']},
+                {'key': 'card_address_state', 'field_value': data['state']},
+                {'key': 'card_address_country', 'field_value': data['country']},
+                {'key': 'total_spend', 'field_value': data['amount']}
+            ]
         }
 
         # Update contact
