@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 from flask import Flask, request, jsonify
 import stripe
@@ -8,9 +9,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging - use DEBUG level for verbose output
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -26,6 +27,17 @@ GHL_LOCATION_ID = os.getenv('GHL_LOCATION_ID')
 GHL_BASE_URL = 'https://services.leadconnectorhq.com'
 
 
+def safe_json(obj, max_length=2000):
+    """Safely convert object to JSON string for logging, truncating if needed."""
+    try:
+        result = json.dumps(obj, default=str, indent=2)
+        if len(result) > max_length:
+            return result[:max_length] + '... [truncated]'
+        return result
+    except Exception as e:
+        return f'[Could not serialize: {e}]'
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint for Railway."""
@@ -37,6 +49,10 @@ def stripe_webhook():
     """Handle incoming Stripe webhook events."""
     payload = request.get_data()
     sig_header = request.headers.get('Stripe-Signature')
+
+    logger.info('=' * 60)
+    logger.info('WEBHOOK RECEIVED')
+    logger.info('=' * 60)
 
     # Verify webhook signature
     try:
@@ -50,12 +66,16 @@ def stripe_webhook():
         logger.error(f'Invalid signature: {e}')
         return jsonify({'error': 'Invalid signature'}), 400
 
-    # Handle specific events
+    # Log event details
     event_type = event['type']
-    logger.info(f'Received event: {event_type}')
+    event_id = event.get('id', 'unknown')
+    logger.info(f'Event ID: {event_id}')
+    logger.info(f'Event Type: {event_type}')
 
     if event_type in ['checkout.session.completed', 'payment_intent.succeeded']:
         handle_payment_event(event)
+    else:
+        logger.info(f'Ignoring event type: {event_type}')
 
     # Always return 200 to prevent Stripe retries
     return jsonify({'received': True}), 200
@@ -64,48 +84,102 @@ def stripe_webhook():
 def handle_payment_event(event):
     """Process payment events and sync to GHL."""
     try:
+        event_type = event['type']
         data = event['data']['object']
+
+        logger.info('-' * 40)
+        logger.info('PROCESSING PAYMENT EVENT')
+        logger.info('-' * 40)
+
+        # Log all available top-level keys in the data object
+        logger.info(f'Available data keys: {list(data.keys())}')
+
+        # Log key fields for debugging
+        logger.debug(f'Full event data:\n{safe_json(data)}')
 
         # Extract customer email from various possible locations
         email = None
+        email_source = None
 
         # 1. checkout.session.completed: customer_details.email
         if 'customer_details' in data and data['customer_details']:
-            email = data['customer_details'].get('email')
+            cd_email = data['customer_details'].get('email')
+            logger.info(f'[Email Check 1] customer_details.email: {cd_email}')
+            if cd_email and not email:
+                email = cd_email
+                email_source = 'customer_details.email'
 
         # 2. payment_intent: receipt_email
-        if not email:
-            email = data.get('receipt_email')
+        receipt_email = data.get('receipt_email')
+        logger.info(f'[Email Check 2] receipt_email: {receipt_email}')
+        if receipt_email and not email:
+            email = receipt_email
+            email_source = 'receipt_email'
 
         # 3. payment_intent: billing_details.email (direct)
-        if not email and 'billing_details' in data and data['billing_details']:
-            email = data['billing_details'].get('email')
+        if 'billing_details' in data and data['billing_details']:
+            bd_email = data['billing_details'].get('email')
+            logger.info(f'[Email Check 3] billing_details.email: {bd_email}')
+            if bd_email and not email:
+                email = bd_email
+                email_source = 'billing_details.email'
 
         # 4. payment_intent: charges.data[0].billing_details.email
-        if not email and 'charges' in data and data['charges'].get('data'):
+        if 'charges' in data and data['charges'].get('data'):
             charges = data['charges']['data']
             if charges and charges[0].get('billing_details'):
-                email = charges[0]['billing_details'].get('email')
+                charge_email = charges[0]['billing_details'].get('email')
+                logger.info(f'[Email Check 4] charges[0].billing_details.email: {charge_email}')
+                if charge_email and not email:
+                    email = charge_email
+                    email_source = 'charges[0].billing_details.email'
+        else:
+            logger.info('[Email Check 4] charges.data: not present')
 
         # 5. payment_intent: latest_charge.billing_details.email (if expanded)
-        if not email and 'latest_charge' in data and isinstance(data['latest_charge'], dict):
-            latest_charge = data['latest_charge']
-            if latest_charge.get('billing_details'):
-                email = latest_charge['billing_details'].get('email')
+        if 'latest_charge' in data:
+            if isinstance(data['latest_charge'], dict):
+                lc = data['latest_charge']
+                if lc.get('billing_details'):
+                    lc_email = lc['billing_details'].get('email')
+                    logger.info(f'[Email Check 5] latest_charge.billing_details.email: {lc_email}')
+                    if lc_email and not email:
+                        email = lc_email
+                        email_source = 'latest_charge.billing_details.email'
+            else:
+                logger.info(f'[Email Check 5] latest_charge is string ID: {data["latest_charge"]}')
+        else:
+            logger.info('[Email Check 5] latest_charge: not present')
 
-        if not email:
-            logger.warning('No email found in payment event')
-            logger.debug(f'Event data keys: {data.keys()}')
+        # 6. Check for customer object or customer email
+        if 'customer_email' in data:
+            cust_email = data.get('customer_email')
+            logger.info(f'[Email Check 6] customer_email: {cust_email}')
+            if cust_email and not email:
+                email = cust_email
+                email_source = 'customer_email'
+
+        logger.info('=' * 40)
+        if email:
+            logger.info(f'EMAIL FOUND: {email}')
+            logger.info(f'Source: {email_source}')
+        else:
+            logger.error('NO EMAIL FOUND IN ANY LOCATION')
+            logger.error('Cannot process payment without email')
             return
+        logger.info('=' * 40)
 
         # Extract billing details from various sources
         billing_details = {}
         address = {}
+        billing_source = 'none'
 
         # Try billing_details first
         if data.get('billing_details'):
             billing_details = data['billing_details']
             address = billing_details.get('address', {}) or {}
+            billing_source = 'billing_details'
+            logger.info(f'[Billing] Found in billing_details: {safe_json(billing_details)}')
 
         # Try charges array for payment_intent
         if not billing_details.get('name') and 'charges' in data and data['charges'].get('data'):
@@ -113,6 +187,8 @@ def handle_payment_event(event):
             if charges and charges[0].get('billing_details'):
                 billing_details = charges[0]['billing_details']
                 address = billing_details.get('address', {}) or {}
+                billing_source = 'charges[0].billing_details'
+                logger.info(f'[Billing] Found in charges[0]: {safe_json(billing_details)}')
 
         # Try customer_details for checkout.session
         if not billing_details.get('name') and 'customer_details' in data:
@@ -120,10 +196,17 @@ def handle_payment_event(event):
             billing_details['name'] = customer_details.get('name')
             if not address:
                 address = customer_details.get('address', {}) or {}
+            billing_source = 'customer_details'
+            logger.info(f'[Billing] Found in customer_details: {safe_json(customer_details)}')
+
+        logger.info(f'[Billing] Final source: {billing_source}')
+        logger.info(f'[Billing] Name: {billing_details.get("name", "NOT FOUND")}')
+        logger.info(f'[Billing] Address: {safe_json(address)}')
 
         # Extract amount and convert from cents to dollars
         amount_cents = data.get('amount_total') or data.get('amount') or 0
         amount_dollars = f"{amount_cents / 100:.2f}"
+        logger.info(f'[Amount] Cents: {amount_cents} -> Dollars: ${amount_dollars}')
 
         # Prepare data for GHL
         ghl_data = {
@@ -136,17 +219,38 @@ def handle_payment_event(event):
             'amount': amount_dollars
         }
 
-        logger.info(f'Processing payment for {email}: ${amount_dollars}')
+        logger.info('-' * 40)
+        logger.info('DATA TO SEND TO GHL:')
+        logger.info(f'Email: {email}')
+        logger.info(f'GHL Data: {safe_json(ghl_data)}')
+        logger.info('-' * 40)
 
         # Sync to GHL
         sync_to_ghl(email, ghl_data)
 
     except Exception as e:
         logger.error(f'Error processing payment event: {e}')
+        import traceback
+        logger.error(f'Traceback:\n{traceback.format_exc()}')
 
 
 def sync_to_ghl(email, data):
     """Look up contact in GHL and update custom fields."""
+    logger.info('-' * 40)
+    logger.info('SYNCING TO GHL')
+    logger.info('-' * 40)
+
+    # Check environment variables
+    if not GHL_API_KEY:
+        logger.error('GHL_API_KEY is not set!')
+        return
+    if not GHL_LOCATION_ID:
+        logger.error('GHL_LOCATION_ID is not set!')
+        return
+
+    logger.info(f'Location ID: {GHL_LOCATION_ID}')
+    logger.info(f'API Key: {GHL_API_KEY[:10]}...{GHL_API_KEY[-4:]}' if GHL_API_KEY else 'NOT SET')
+
     headers = {
         'Authorization': f'Bearer {GHL_API_KEY}',
         'Content-Type': 'application/json',
@@ -156,20 +260,29 @@ def sync_to_ghl(email, data):
     try:
         # Look up contact by email using v2 API
         lookup_url = f'{GHL_BASE_URL}/contacts/?locationId={GHL_LOCATION_ID}&query={email}'
+        logger.info(f'[GHL] Looking up contact: {lookup_url}')
+
         response = requests.get(lookup_url, headers=headers)
+        logger.info(f'[GHL] Lookup response status: {response.status_code}')
+        logger.info(f'[GHL] Lookup response body: {safe_json(response.json()) if response.status_code == 200 else response.text}')
 
         if response.status_code != 200:
-            logger.error(f'GHL lookup failed: {response.status_code} - {response.text}')
+            logger.error(f'[GHL] Lookup failed: {response.status_code} - {response.text}')
             return
 
         result = response.json()
         contacts = result.get('contacts', [])
 
         if not contacts:
-            logger.warning(f'No contact found in GHL for email: {email}')
+            logger.warning(f'[GHL] No contact found for email: {email}')
+            logger.info('[GHL] Make sure the contact exists in GHL with this exact email')
             return
 
-        contact_id = contacts[0].get('id')
+        contact = contacts[0]
+        contact_id = contact.get('id')
+        logger.info(f'[GHL] Found contact: {contact_id}')
+        logger.info(f'[GHL] Contact name: {contact.get("name", contact.get("firstName", ""))} {contact.get("lastName", "")}')
+        logger.info(f'[GHL] Contact email: {contact.get("email")}')
 
         # Prepare custom fields update payload (v2 format)
         update_payload = {
@@ -184,19 +297,36 @@ def sync_to_ghl(email, data):
             ]
         }
 
+        logger.info(f'[GHL] Update payload:\n{safe_json(update_payload)}')
+
         # Update contact
         update_url = f'{GHL_BASE_URL}/contacts/{contact_id}'
+        logger.info(f'[GHL] Updating contact: PUT {update_url}')
+
         update_response = requests.put(update_url, headers=headers, json=update_payload)
+        logger.info(f'[GHL] Update response status: {update_response.status_code}')
+        logger.info(f'[GHL] Update response body: {update_response.text[:1000]}')
 
         if update_response.status_code == 200:
-            logger.info(f'Successfully updated GHL contact {contact_id} for {email}')
+            logger.info('=' * 40)
+            logger.info(f'SUCCESS: Updated GHL contact {contact_id} for {email}')
+            logger.info('=' * 40)
         else:
-            logger.error(f'GHL update failed: {update_response.status_code} - {update_response.text}')
+            logger.error('=' * 40)
+            logger.error(f'FAILED: GHL update returned {update_response.status_code}')
+            logger.error(f'Response: {update_response.text}')
+            logger.error('=' * 40)
 
     except Exception as e:
-        logger.error(f'Error syncing to GHL: {e}')
+        logger.error(f'[GHL] Error syncing to GHL: {e}')
+        import traceback
+        logger.error(f'Traceback:\n{traceback.format_exc()}')
 
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
+    logger.info(f'Starting app on port {port}')
+    logger.info(f'GHL Location ID configured: {bool(GHL_LOCATION_ID)}')
+    logger.info(f'GHL API Key configured: {bool(GHL_API_KEY)}')
+    logger.info(f'Stripe Webhook Secret configured: {bool(STRIPE_WEBHOOK_SECRET)}')
     app.run(host='0.0.0.0', port=port)
