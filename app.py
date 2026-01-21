@@ -140,13 +140,13 @@ def sync_to_ghl(email, data):
         # Prepare custom fields update payload
         update_payload = {
             'customField': {
-                'stripe_card_name': data['name'],
-                'stripe_card_address_line_1': data['address_line_1'],
-                'stripe_card_address_line_2': data['address_line_2'],
-                'stripe_card_city': data['city'],
-                'stripe_card_state': data['state'],
-                'stripe_card_country': data['country'],
-                'stripe_total_spend': data['amount']
+                'card_name': data['name'],
+                'card_address_line_1': data['address_line_1'],
+                'card_address_line_2': data['address_line_2'],
+                'card_address_city': data['city'],
+                'card_address_state': data['state'],
+                'card_address_country': data['country'],
+                'total_spend': data['amount']
             }
         }
 
