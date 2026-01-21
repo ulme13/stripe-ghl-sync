@@ -66,28 +66,60 @@ def handle_payment_event(event):
     try:
         data = event['data']['object']
 
-        # Extract customer email
+        # Extract customer email from various possible locations
         email = None
+
+        # 1. checkout.session.completed: customer_details.email
         if 'customer_details' in data and data['customer_details']:
             email = data['customer_details'].get('email')
+
+        # 2. payment_intent: receipt_email
+        if not email:
+            email = data.get('receipt_email')
+
+        # 3. payment_intent: billing_details.email (direct)
         if not email and 'billing_details' in data and data['billing_details']:
             email = data['billing_details'].get('email')
 
+        # 4. payment_intent: charges.data[0].billing_details.email
+        if not email and 'charges' in data and data['charges'].get('data'):
+            charges = data['charges']['data']
+            if charges and charges[0].get('billing_details'):
+                email = charges[0]['billing_details'].get('email')
+
+        # 5. payment_intent: latest_charge.billing_details.email (if expanded)
+        if not email and 'latest_charge' in data and isinstance(data['latest_charge'], dict):
+            latest_charge = data['latest_charge']
+            if latest_charge.get('billing_details'):
+                email = latest_charge['billing_details'].get('email')
+
         if not email:
             logger.warning('No email found in payment event')
+            logger.debug(f'Event data keys: {data.keys()}')
             return
 
-        # Extract billing details
-        billing_details = data.get('billing_details', {}) or {}
-        address = billing_details.get('address', {}) or {}
+        # Extract billing details from various sources
+        billing_details = {}
+        address = {}
 
-        # For checkout.session.completed, get customer_details if billing_details is empty
+        # Try billing_details first
+        if data.get('billing_details'):
+            billing_details = data['billing_details']
+            address = billing_details.get('address', {}) or {}
+
+        # Try charges array for payment_intent
+        if not billing_details.get('name') and 'charges' in data and data['charges'].get('data'):
+            charges = data['charges']['data']
+            if charges and charges[0].get('billing_details'):
+                billing_details = charges[0]['billing_details']
+                address = billing_details.get('address', {}) or {}
+
+        # Try customer_details for checkout.session
         if not billing_details.get('name') and 'customer_details' in data:
             customer_details = data.get('customer_details', {}) or {}
-            if not billing_details:
-                billing_details = {}
             billing_details['name'] = customer_details.get('name')
-            address = customer_details.get('address', {}) or {}
+            if not address:
+                address = customer_details.get('address', {}) or {}
 
         # Extract amount and convert from cents to dollars
         amount_cents = data.get('amount_total') or data.get('amount') or 0
