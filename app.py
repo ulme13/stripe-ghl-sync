@@ -72,7 +72,7 @@ def stripe_webhook():
     logger.info(f'Event ID: {event_id}')
     logger.info(f'Event Type: {event_type}')
 
-    if event_type in ['checkout.session.completed', 'payment_intent.succeeded']:
+    if event_type in ['checkout.session.completed', 'payment_intent.succeeded', 'charge.succeeded']:
         handle_payment_event(event)
     else:
         logger.info(f'Ignoring event type: {event_type}')
