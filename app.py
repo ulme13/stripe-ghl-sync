@@ -94,10 +94,21 @@ def handle_payment_event(event):
         # Log all available top-level keys in the data object
         logger.info(f'Available data keys: {list(data.keys())}')
 
+        # Log metadata - this often contains contactId from GHL
+        metadata = data.get('metadata', {})
+        logger.info(f'[Metadata] {safe_json(metadata)}')
+
+        # Check for GHL contactId in metadata FIRST (most reliable method)
+        contact_id = metadata.get('contactId')
+        if contact_id:
+            logger.info(f'[Contact] Found contactId in metadata: {contact_id}')
+        else:
+            logger.info('[Contact] No contactId in metadata')
+
         # Log key fields for debugging
         logger.debug(f'Full event data:\n{safe_json(data)}')
 
-        # Extract customer email from various possible locations
+        # Extract customer email from various possible locations (as fallback)
         email = None
         email_source = None
 
@@ -160,12 +171,14 @@ def handle_payment_event(event):
                 email_source = 'customer_email'
 
         logger.info('=' * 40)
-        if email:
+        if contact_id:
+            logger.info(f'USING CONTACT ID FROM METADATA: {contact_id}')
+        elif email:
             logger.info(f'EMAIL FOUND: {email}')
             logger.info(f'Source: {email_source}')
         else:
-            logger.error('NO EMAIL FOUND IN ANY LOCATION')
-            logger.error('Cannot process payment without email')
+            logger.error('NO CONTACT ID OR EMAIL FOUND')
+            logger.error('Cannot process payment - need either contactId in metadata or email')
             return
         logger.info('=' * 40)
 
@@ -221,12 +234,13 @@ def handle_payment_event(event):
 
         logger.info('-' * 40)
         logger.info('DATA TO SEND TO GHL:')
-        logger.info(f'Email: {email}')
+        logger.info(f'Contact ID: {contact_id}')
+        logger.info(f'Email (fallback): {email}')
         logger.info(f'GHL Data: {safe_json(ghl_data)}')
         logger.info('-' * 40)
 
-        # Sync to GHL
-        sync_to_ghl(email, ghl_data)
+        # Sync to GHL - prefer contact_id, fallback to email lookup
+        sync_to_ghl(ghl_data, contact_id=contact_id, email=email)
 
     except Exception as e:
         logger.error(f'Error processing payment event: {e}')
@@ -234,8 +248,8 @@ def handle_payment_event(event):
         logger.error(f'Traceback:\n{traceback.format_exc()}')
 
 
-def sync_to_ghl(email, data):
-    """Look up contact in GHL and update custom fields."""
+def sync_to_ghl(data, contact_id=None, email=None):
+    """Update contact in GHL. Uses contact_id if provided, otherwise looks up by email."""
     logger.info('-' * 40)
     logger.info('SYNCING TO GHL')
     logger.info('-' * 40)
@@ -258,31 +272,39 @@ def sync_to_ghl(email, data):
     }
 
     try:
-        # Look up contact by email using v2 API
-        lookup_url = f'{GHL_BASE_URL}/contacts/?locationId={GHL_LOCATION_ID}&query={email}'
-        logger.info(f'[GHL] Looking up contact: {lookup_url}')
+        # If we don't have a contact_id, look up by email
+        if not contact_id:
+            if not email:
+                logger.error('[GHL] No contact_id or email provided - cannot update')
+                return
 
-        response = requests.get(lookup_url, headers=headers)
-        logger.info(f'[GHL] Lookup response status: {response.status_code}')
-        logger.info(f'[GHL] Lookup response body: {safe_json(response.json()) if response.status_code == 200 else response.text}')
+            logger.info(f'[GHL] No contact_id provided, looking up by email: {email}')
+            lookup_url = f'{GHL_BASE_URL}/contacts/?locationId={GHL_LOCATION_ID}&query={email}'
+            logger.info(f'[GHL] Looking up contact: {lookup_url}')
 
-        if response.status_code != 200:
-            logger.error(f'[GHL] Lookup failed: {response.status_code} - {response.text}')
-            return
+            response = requests.get(lookup_url, headers=headers)
+            logger.info(f'[GHL] Lookup response status: {response.status_code}')
+            logger.info(f'[GHL] Lookup response body: {safe_json(response.json()) if response.status_code == 200 else response.text}')
 
-        result = response.json()
-        contacts = result.get('contacts', [])
+            if response.status_code != 200:
+                logger.error(f'[GHL] Lookup failed: {response.status_code} - {response.text}')
+                return
 
-        if not contacts:
-            logger.warning(f'[GHL] No contact found for email: {email}')
-            logger.info('[GHL] Make sure the contact exists in GHL with this exact email')
-            return
+            result = response.json()
+            contacts = result.get('contacts', [])
 
-        contact = contacts[0]
-        contact_id = contact.get('id')
-        logger.info(f'[GHL] Found contact: {contact_id}')
-        logger.info(f'[GHL] Contact name: {contact.get("name", contact.get("firstName", ""))} {contact.get("lastName", "")}')
-        logger.info(f'[GHL] Contact email: {contact.get("email")}')
+            if not contacts:
+                logger.warning(f'[GHL] No contact found for email: {email}')
+                logger.info('[GHL] Make sure the contact exists in GHL with this exact email')
+                return
+
+            contact = contacts[0]
+            contact_id = contact.get('id')
+            logger.info(f'[GHL] Found contact via email lookup: {contact_id}')
+            logger.info(f'[GHL] Contact name: {contact.get("name", contact.get("firstName", ""))} {contact.get("lastName", "")}')
+            logger.info(f'[GHL] Contact email: {contact.get("email")}')
+        else:
+            logger.info(f'[GHL] Using contact_id from metadata: {contact_id}')
 
         # Prepare custom fields update payload (v2 format)
         update_payload = {
@@ -309,7 +331,7 @@ def sync_to_ghl(email, data):
 
         if update_response.status_code == 200:
             logger.info('=' * 40)
-            logger.info(f'SUCCESS: Updated GHL contact {contact_id} for {email}')
+            logger.info(f'SUCCESS: Updated GHL contact {contact_id}')
             logger.info('=' * 40)
         else:
             logger.error('=' * 40)
